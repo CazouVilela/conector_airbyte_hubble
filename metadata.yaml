@@ -2,7 +2,7 @@ data:
   connectorSubtype: api
   connectorType: source
   definitionId: "hubble-source-001"
-  dockerImageTag: 0.1.0
+  dockerImageTag: 1.0.0
   dockerRepository: airbyte/source-hubble
   githubIssueLabel: source-hubble
   license: MIT
@@ -12,7 +12,7 @@ data:
       enabled: false
     oss:
       enabled: true
-  releaseStage: alpha
+  releaseStage: beta
   supportLevel: community
   documentationUrl: https://docs.grupohub.com
   tags:
