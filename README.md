@@ -2,7 +2,7 @@
 
 Conector customizado para [Airbyte](https://airbyte.com) que extrai dados da API Hubble (data2apis.com).
 
-**Versao**: 1.0.0 | **Licenca**: MIT | **Status**: Producao
+**Versao**: 1.0.1 | **Licenca**: MIT | **Status**: Producao
 
 ## Por que um conector customizado?
 
@@ -67,7 +67,8 @@ kind load docker-image airbyte/source-hubble:1.0.0 --name airbyte
 |-------|------|-------------|--------|-----------|
 | `api_token` | string | Sim | - | Token JWT para autenticacao |
 | `start_date` | string | Nao | - | Data inicial para sync incremental (ISO 8601) |
-| `page_size` | integer | Nao | 500 | Registros por pagina (1-1000) |
+| `page_size` | integer | Nao | 200 | Registros por pagina (1-1000). Reduza para APIs lentas. |
+| `inter_page_delay` | number | Nao | 0.5 | Delay em segundos entre paginas (0-30). Aumente para APIs com rate limit. |
 | `request_timeout` | integer | Nao | 60 | Timeout em segundos (10-300) |
 | `max_retries` | integer | Nao | 5 | Tentativas em caso de erro (1-10) |
 | `endpoints` | array | Sim | - | Lista de endpoints para extrair |
@@ -344,6 +345,12 @@ python main.py discover --config /tmp/config.json
 - requests-mock >= 1.11.0
 
 ## Changelog
+
+### v1.0.1 (2026-01-14)
+- Delay configuravel entre paginas (inter_page_delay)
+- Page size padrao reduzido de 500 para 200
+- Logging melhorado com checkpoints de retomada
+- Informacoes de pagina e registros nas mensagens de retry
 
 ### v1.0.0 (2026-01-14)
 - Limpeza de null bytes

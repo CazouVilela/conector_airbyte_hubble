@@ -25,11 +25,19 @@ connectionSpecification:
     page_size:
       type: integer
       title: Tamanho da Pagina
-      description: Numero de registros por pagina (padrao 500, max 1000)
-      default: 500
+      description: Numero de registros por pagina (padrao 200, max 1000). Reduza para APIs lentas.
+      default: 200
       minimum: 1
       maximum: 1000
       order: 2
+    inter_page_delay:
+      type: number
+      title: Delay entre Paginas (segundos)
+      description: Tempo de espera entre requisicoes de paginas (padrao 0.5). Aumente para APIs com rate limit.
+      default: 0.5
+      minimum: 0
+      maximum: 30
+      order: 3
     request_timeout:
       type: integer
       title: Timeout (segundos)
@@ -37,7 +45,7 @@ connectionSpecification:
       default: 60
       minimum: 10
       maximum: 300
-      order: 3
+      order: 4
     max_retries:
       type: integer
       title: Max Retries
@@ -45,12 +53,12 @@ connectionSpecification:
       default: 5
       minimum: 1
       maximum: 10
-      order: 4
+      order: 5
     endpoints:
       type: array
       title: Endpoints (Streams)
       description: Lista de endpoints para extrair dados
-      order: 5
+      order: 6
       items:
         type: object
         required:

@@ -15,6 +15,7 @@ def valid_config():
         "page_size": 100,
         "request_timeout": 30,
         "max_retries": 3,
+        "inter_page_delay": 0,  # Desabilita delay nos testes
         "endpoints": [
             {
                 "name": "vacancies",

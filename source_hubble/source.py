@@ -19,6 +19,7 @@ Versao: 1.0.0
 import json
 import logging
 import re
+import time
 from typing import Any, Iterable, List, Mapping, MutableMapping, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -163,9 +164,10 @@ class HubbleStream(HttpStream):
 
         # Configuracoes do conector
         self.config = config
-        self.page_size = config.get("page_size", 500)
+        self.page_size = config.get("page_size", 200)
         self.request_timeout = config.get("request_timeout", 60)
         self.max_retries = config.get("max_retries", 5)
+        self.inter_page_delay = config.get("inter_page_delay", 0.5)
 
         # Estado do cursor
         self._cursor_value = config.get("start_date", "2020-01-01T00:00:00.000Z")
@@ -183,7 +185,8 @@ class HubbleStream(HttpStream):
             f"Inicializando stream '{stream_name}' | "
             f"endpoint={endpoint_url} | "
             f"page_size={self.page_size} | "
-            f"timeout={self.request_timeout}s"
+            f"timeout={self.request_timeout}s | "
+            f"delay={self.inter_page_delay}s"
         )
 
         super().__init__(authenticator=authenticator, **kwargs)
@@ -347,7 +350,25 @@ class HubbleStream(HttpStream):
             )
             return None
 
-        return {"last_id": records[-1].get("_id")}
+        last_id = records[-1].get("_id")
+
+        # Delay entre paginas para nao sobrecarregar a API
+        if self.inter_page_delay > 0:
+            logger.debug(
+                f"Stream '{self.name}': aguardando {self.inter_page_delay}s antes da proxima pagina"
+            )
+            time.sleep(self.inter_page_delay)
+
+        # Log de checkpoint para facilitar retomada em caso de falha
+        logger.info(
+            f"Stream '{self.name}': checkpoint | "
+            f"pagina={self._pages_read} | "
+            f"registros={self._records_read} | "
+            f"last_id={last_id} | "
+            f"cursor={self._cursor_value}"
+        )
+
+        return {"last_id": last_id}
 
     def request_body_json(
         self,
@@ -396,7 +417,10 @@ class HubbleStream(HttpStream):
         if should:
             logger.warning(
                 f"Stream '{self.name}': retry necessario | "
-                f"status={response.status_code}"
+                f"status={response.status_code} | "
+                f"pagina={self._pages_read} | "
+                f"registros={self._records_read} | "
+                f"last_id={self._last_id}"
             )
 
         return should

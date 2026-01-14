@@ -16,6 +16,6 @@ ENV AIRBYTE_ENTRYPOINT="python /airbyte/integration_code/main.py"
 ENTRYPOINT ["python", "/airbyte/integration_code/main.py"]
 
 # Labels
-LABEL io.airbyte.version=1.0.0
+LABEL io.airbyte.version=1.0.1
 LABEL io.airbyte.name=airbyte/source-hubble
 LABEL io.airbyte.protocol-version=0.2.0
