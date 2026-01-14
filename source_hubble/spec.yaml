@@ -1,0 +1,55 @@
+documentationUrl: https://docs.grupohub.com
+connectionSpecification:
+  $schema: http://json-schema.org/draft-07/schema#
+  title: Hubble Source Spec
+  type: object
+  required:
+    - api_token
+    - endpoints
+  additionalProperties: true
+  properties:
+    api_token:
+      type: string
+      title: API Token
+      description: Token JWT para autenticacao na API Hubble
+      airbyte_secret: true
+      order: 0
+    start_date:
+      type: string
+      title: Data Inicial
+      description: Data inicial para sync incremental (ISO format)
+      examples:
+        - "2024-01-01T00:00:00.000Z"
+      order: 1
+    endpoints:
+      type: array
+      title: Endpoints (Streams)
+      description: Lista de endpoints para extrair dados
+      order: 2
+      items:
+        type: object
+        required:
+          - name
+          - endpoint_url
+        properties:
+          name:
+            type: string
+            title: Nome do Stream
+            description: Nome que aparecera no Airbyte (ex. vacancies, candidates)
+            order: 0
+          endpoint_url:
+            type: string
+            title: URL Completa do Endpoint
+            description: URL completa do endpoint da API
+            examples:
+              - "https://hub.data2apis.com/dataset/all-hub-vacancies"
+            order: 1
+      default:
+        - name: vacancies
+          endpoint_url: "https://hub.data2apis.com/dataset/all-hub-vacancies"
+        - name: candidates
+          endpoint_url: "https://hub.data2apis.com/dataset/all-hub-candidates"
+        - name: projetos
+          endpoint_url: "https://hub.data2apis.com/dataset/all-hub-projetos"
+        - name: companies
+          endpoint_url: "https://hub.data2apis.com/dataset/all-hub-companies"
