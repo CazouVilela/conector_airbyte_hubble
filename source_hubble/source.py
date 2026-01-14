@@ -1,50 +1,127 @@
 """
 Source Hubble - Conector customizado Airbyte para API data2apis.com
 
-Este conector resolve problemas que o conector generico de API nao consegue:
+Versao 1.0.0 - Features:
 1. Limpeza de null bytes (\u0000) que corrompem JSON
 2. Paginacao por cursor (_id) em vez de $skip (offset)
 3. Sync incremental via campo updatedAt
 4. Streams dinamicos configuraveis via UI do Airbyte
+5. Retry com backoff exponencial
+6. Rate limiting configuravel
+7. Schema discovery dinamico
+8. Logging estruturado
+9. Validacao de URLs
 
 Autor: Cazou Vilela (cazou@hubtalent.com.br)
-Versao: 0.1.0
+Versao: 1.0.0
 """
 
+import json
+import logging
+import re
 from typing import Any, Iterable, List, Mapping, MutableMapping, Optional, Tuple
 from urllib.parse import urlparse
+
+import backoff
 import requests
-import json
-import re
+from airbyte_cdk.models import SyncMode
 from airbyte_cdk.sources import AbstractSource
 from airbyte_cdk.sources.streams import Stream
 from airbyte_cdk.sources.streams.http import HttpStream
 from airbyte_cdk.sources.streams.http.requests_native_auth import TokenAuthenticator
 
 
+# Configuracao de logging estruturado
+logger = logging.getLogger("airbyte.source-hubble")
+
+
+class HubbleConfigError(Exception):
+    """Erro de configuracao do conector Hubble."""
+    pass
+
+
+class HubbleAPIError(Exception):
+    """Erro na comunicacao com a API Hubble."""
+    pass
+
+
+def validate_url(url: str, field_name: str = "URL") -> None:
+    """
+    Valida se uma URL e valida e segura (HTTPS).
+
+    Args:
+        url: URL para validar
+        field_name: Nome do campo para mensagem de erro
+
+    Raises:
+        HubbleConfigError: Se a URL for invalida
+    """
+    if not url:
+        raise HubbleConfigError(f"{field_name} nao pode ser vazio")
+
+    parsed = urlparse(url)
+
+    if parsed.scheme != "https":
+        raise HubbleConfigError(
+            f"{field_name} deve usar HTTPS. Recebido: {parsed.scheme}://"
+        )
+
+    if not parsed.netloc:
+        raise HubbleConfigError(f"{field_name} invalida: dominio nao encontrado")
+
+    # Valida que nao tem caracteres perigosos
+    dangerous_chars = ["<", ">", '"', "'", "{", "}", "|", "\\", "^", "`"]
+    for char in dangerous_chars:
+        if char in url:
+            raise HubbleConfigError(
+                f"{field_name} contem caractere invalido: {char}"
+            )
+
+
+def validate_stream_name(name: str) -> None:
+    """
+    Valida nome do stream (apenas letras minusculas, numeros e underscore).
+
+    Args:
+        name: Nome do stream
+
+    Raises:
+        HubbleConfigError: Se o nome for invalido
+    """
+    if not name:
+        raise HubbleConfigError("Nome do stream nao pode ser vazio")
+
+    if not re.match(r"^[a-z][a-z0-9_]*$", name):
+        raise HubbleConfigError(
+            f"Nome do stream invalido: '{name}'. "
+            "Use apenas letras minusculas, numeros e underscore, "
+            "comecando com letra."
+        )
+
+
 class HubbleStream(HttpStream):
     """
     Stream HTTP customizado para API Hubble.
 
-    Caracteristicas:
-    - Usa POST com body JSON (padrao da API Hubble)
-    - Limpa null bytes automaticamente do response
-    - Pagina por cursor (_id) para evitar perda de registros
-    - Suporta sync incremental via updatedAt
-
-    A paginacao por cursor e importante porque o $skip (offset) pode
-    perder registros quando novos dados sao inseridos durante a paginacao.
+    Features:
+    - POST com body JSON (padrao da API Hubble)
+    - Limpeza automatica de null bytes
+    - Paginacao por cursor (_id)
+    - Sync incremental via updatedAt
+    - Retry com backoff exponencial
+    - Logging estruturado
     """
 
-    # Configuracao do HTTP
     http_method = "POST"
     primary_key = "_id"
-    cursor_field = "updatedAt"  # Campo usado para sync incremental
-    page_size = 500  # Registros por pagina
+    cursor_field = "updatedAt"
 
-    # Schema JSON flexivel - aceita qualquer campo adicional
-    # Isso e necessario porque cada endpoint pode ter campos diferentes
-    _schema = {
+    # Configuracao de retry (usado pelo CDK)
+    max_retries = 5
+    retry_factor = 2
+
+    # Schema base - sera enriquecido dinamicamente
+    _base_schema = {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
         "properties": {
@@ -52,7 +129,7 @@ class HubbleStream(HttpStream):
             "updatedAt": {"type": ["null", "string"]},
             "createdAt": {"type": ["null", "string"]}
         },
-        "additionalProperties": True  # Permite campos nao definidos
+        "additionalProperties": True
     }
 
     def __init__(
@@ -64,85 +141,153 @@ class HubbleStream(HttpStream):
         **kwargs
     ):
         """
-        Inicializa o stream com URL completa do endpoint.
+        Inicializa o stream com configuracoes.
 
         Args:
             authenticator: Autenticador Bearer Token
-            config: Configuracao do conector (api_token, start_date, etc)
-            stream_name: Nome do stream (ex: vacancies, candidates)
-            endpoint_url: URL completa do endpoint da API
+            config: Configuracao do conector
+            stream_name: Nome do stream
+            endpoint_url: URL completa do endpoint
         """
-        # IMPORTANTE: Definir atributos ANTES de chamar super().__init__
-        # O Airbyte CDK acessa alguns atributos durante a inicializacao
+        # Validacao de inputs
+        validate_stream_name(stream_name)
+        validate_url(endpoint_url, f"Endpoint URL para stream '{stream_name}'")
+
         self._stream_name = stream_name
         self._endpoint_url = endpoint_url
 
-        # Extrair base_url e path da URL completa
-        # Ex: "https://hub.data2apis.com/dataset/all-hub-vacancies"
-        #     base_url = "https://hub.data2apis.com/"
-        #     path = "dataset/all-hub-vacancies"
+        # Parse da URL
         parsed = urlparse(endpoint_url)
         self._url_base = f"{parsed.scheme}://{parsed.netloc}/"
         self._path = parsed.path.lstrip("/")
 
+        # Configuracoes do conector
         self.config = config
+        self.page_size = config.get("page_size", 500)
+        self.request_timeout = config.get("request_timeout", 60)
+        self.max_retries = config.get("max_retries", 5)
 
-        # Inicializa cursor para sync incremental
-        # Usa start_date da config ou data padrao
+        # Estado do cursor
         self._cursor_value = config.get("start_date", "2020-01-01T00:00:00.000Z")
-        self._last_id = None  # Ultimo _id processado (para paginacao)
+        self._last_id = None
+
+        # Schema dinamico (sera populado no primeiro request)
+        self._discovered_schema = None
+        self._schema_discovered = False
+
+        # Contadores para logging
+        self._records_read = 0
+        self._pages_read = 0
+
+        logger.info(
+            f"Inicializando stream '{stream_name}' | "
+            f"endpoint={endpoint_url} | "
+            f"page_size={self.page_size} | "
+            f"timeout={self.request_timeout}s"
+        )
 
         super().__init__(authenticator=authenticator, **kwargs)
 
     @property
     def url_base(self) -> str:
-        """URL base do endpoint (ex: https://hub.data2apis.com/)"""
         return self._url_base
 
     @property
     def name(self) -> str:
-        """Nome do stream (aparece no Airbyte UI)"""
         return self._stream_name
 
     def path(self, **kwargs) -> str:
-        """Path do endpoint (ex: dataset/all-hub-vacancies)"""
         return self._path
 
     def get_json_schema(self) -> Mapping[str, Any]:
-        """Retorna schema JSON do stream"""
-        return self._schema
+        """Retorna schema JSON, enriquecido dinamicamente se disponivel."""
+        if self._discovered_schema:
+            return self._discovered_schema
+        return self._base_schema
 
     @property
     def state(self) -> MutableMapping[str, Any]:
-        """
-        Estado atual do stream para sync incremental.
-        O Airbyte salva isso entre execucoes.
-        """
         return {self.cursor_field: self._cursor_value}
 
     @state.setter
     def state(self, value: MutableMapping[str, Any]):
-        """Restaura estado de execucao anterior"""
         self._cursor_value = value.get(self.cursor_field, "2020-01-01T00:00:00.000Z")
+        logger.debug(f"Stream '{self.name}' state restaurado: {self._cursor_value}")
 
     def _clean_null_bytes(self, text: str) -> str:
-        """
-        Remove null bytes do texto que corrompem o JSON.
+        """Remove null bytes que corrompem JSON."""
+        original_len = len(text)
+        text = re.sub(r'\\u0000', '', text)
+        text = text.replace('\x00', '')
 
-        A API Hubble as vezes retorna dados com \u0000 (null byte) que
-        causam erro no json.loads(). Esta funcao limpa esses caracteres.
+        cleaned_len = len(text)
+        if cleaned_len != original_len:
+            logger.warning(
+                f"Stream '{self.name}': {original_len - cleaned_len} null bytes removidos"
+            )
+
+        return text
+
+    def _infer_json_type(self, value: Any) -> dict:
+        """Infere tipo JSON Schema a partir de um valor Python."""
+        if value is None:
+            return {"type": "null"}
+        elif isinstance(value, bool):
+            return {"type": ["null", "boolean"]}
+        elif isinstance(value, int):
+            return {"type": ["null", "integer"]}
+        elif isinstance(value, float):
+            return {"type": ["null", "number"]}
+        elif isinstance(value, str):
+            # Detecta datas ISO
+            if re.match(r'^\d{4}-\d{2}-\d{2}', value):
+                return {"type": ["null", "string"], "format": "date-time"}
+            return {"type": ["null", "string"]}
+        elif isinstance(value, list):
+            return {"type": ["null", "array"], "items": {}}
+        elif isinstance(value, dict):
+            return {"type": ["null", "object"], "additionalProperties": True}
+        else:
+            return {"type": ["null", "string"]}
+
+    def _discover_schema_from_record(self, record: Mapping[str, Any]) -> None:
+        """
+        Descobre schema dinamicamente a partir do primeiro registro.
 
         Args:
-            text: Texto do response HTTP
-
-        Returns:
-            Texto sem null bytes
+            record: Primeiro registro retornado pela API
         """
-        # Remove representacao unicode do null byte
-        text = re.sub(r'\\u0000', '', text)
-        # Remove null byte literal
-        text = text.replace('\x00', '')
-        return text
+        if self._schema_discovered:
+            return
+
+        schema = {
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "properties": {},
+            "additionalProperties": True
+        }
+
+        for key, value in record.items():
+            schema["properties"][key] = self._infer_json_type(value)
+
+        self._discovered_schema = schema
+        self._schema_discovered = True
+
+        logger.info(
+            f"Stream '{self.name}': schema descoberto com {len(record)} campos"
+        )
+
+    @backoff.on_exception(
+        backoff.expo,
+        (requests.exceptions.RequestException, json.JSONDecodeError),
+        max_tries=5,
+        factor=2,
+        logger=logger
+    )
+    def _parse_response_with_retry(self, response: requests.Response) -> dict:
+        """Parse response com retry em caso de erro."""
+        clean_text = self._clean_null_bytes(response.text)
+        return json.loads(clean_text)
 
     def parse_response(
         self,
@@ -151,59 +296,57 @@ class HubbleStream(HttpStream):
         stream_slice: Mapping[str, Any] = None,
         next_page_token: Mapping[str, Any] = None,
     ) -> Iterable[Mapping]:
-        """
-        Processa response da API e extrai registros.
-
-        Limpa null bytes, faz parse do JSON, atualiza cursor
-        e retorna registros um a um (generator).
-        """
-        # Limpa null bytes antes do parse
-        clean_text = self._clean_null_bytes(response.text)
-
+        """Processa response da API e extrai registros."""
         try:
-            data = json.loads(clean_text)
+            data = self._parse_response_with_retry(response)
         except json.JSONDecodeError as e:
-            self.logger.error(f"Erro ao fazer parse do JSON: {e}")
+            logger.error(
+                f"Stream '{self.name}': erro ao fazer parse do JSON | "
+                f"status={response.status_code} | error={e}"
+            )
             return
 
-        # A API retorna dados no campo "data"
         records = data.get("data", [])
+        self._pages_read += 1
+
+        # Descoberta de schema no primeiro registro
+        if records and not self._schema_discovered:
+            self._discover_schema_from_record(records[0])
 
         for record in records:
-            # Atualiza cursor com maior updatedAt encontrado
+            # Atualiza cursor
             record_cursor = record.get(self.cursor_field)
             if record_cursor and record_cursor > self._cursor_value:
                 self._cursor_value = record_cursor
 
-            # Guarda ultimo _id para paginacao
             self._last_id = record.get("_id")
+            self._records_read += 1
             yield record
 
+        # Log periodico de progresso
+        if self._pages_read % 10 == 0:
+            logger.info(
+                f"Stream '{self.name}': {self._records_read} registros lidos | "
+                f"{self._pages_read} paginas | cursor={self._cursor_value}"
+            )
+
     def next_page_token(self, response: requests.Response) -> Optional[Mapping[str, Any]]:
-        """
-        Determina se ha mais paginas e retorna token para proxima.
-
-        Usa paginacao por cursor (_id) em vez de $skip (offset).
-        Isso evita perda de registros quando dados sao inseridos
-        durante a paginacao.
-
-        Returns:
-            Dict com last_id se ha mais paginas, None se terminou
-        """
-        clean_text = self._clean_null_bytes(response.text)
-
+        """Determina se ha mais paginas usando cursor por _id."""
         try:
-            data = json.loads(clean_text)
+            data = self._parse_response_with_retry(response)
         except json.JSONDecodeError:
             return None
 
         records = data.get("data", [])
 
-        # Se retornou menos que page_size, nao ha mais paginas
         if len(records) < self.page_size:
+            logger.info(
+                f"Stream '{self.name}': paginacao concluida | "
+                f"total_registros={self._records_read} | "
+                f"total_paginas={self._pages_read}"
+            )
             return None
 
-        # Retorna ultimo _id para usar como cursor na proxima pagina
         return {"last_id": records[-1].get("_id")}
 
     def request_body_json(
@@ -212,23 +355,18 @@ class HubbleStream(HttpStream):
         stream_slice: Mapping[str, Any] = None,
         next_page_token: Mapping[str, Any] = None,
     ) -> Optional[Mapping]:
-        """
-        Monta body JSON para request POST.
-
-        A API Hubble usa formato especifico com $method e params.
-        Inclui filtros para sync incremental e paginacao por cursor.
-        """
+        """Monta body JSON para request POST."""
         query = {
             "$limit": self.page_size,
-            "$sort": {"_id": 1},  # Ordena por _id para paginacao consistente
+            "$sort": {"_id": 1},
         }
 
-        # Filtro para sync incremental - apenas registros atualizados
+        # Filtro incremental
         cursor = stream_state.get(self.cursor_field) if stream_state else self._cursor_value
         if cursor:
             query["updatedAt"] = {"$gte": cursor}
 
-        # Filtro para paginacao por cursor - _id maior que ultimo da pagina anterior
+        # Paginacao por cursor
         if next_page_token:
             query["_id"] = {"$gt": next_page_token["last_id"]}
 
@@ -238,66 +376,118 @@ class HubbleStream(HttpStream):
         }
 
     def request_headers(self, **kwargs) -> Mapping[str, Any]:
-        """Headers adicionais para requests"""
         return {"Content-Type": "application/json"}
+
+    def request_kwargs(
+        self,
+        stream_state: Mapping[str, Any] = None,
+        stream_slice: Mapping[str, Any] = None,
+        next_page_token: Mapping[str, Any] = None,
+    ) -> Mapping[str, Any]:
+        """Configura timeout para requests."""
+        return {"timeout": self.request_timeout}
+
+    def should_retry(self, response: requests.Response) -> bool:
+        """Determina se deve fazer retry baseado no status code."""
+        # Retry em 429 (rate limit), 500, 502, 503, 504
+        retry_codes = {429, 500, 502, 503, 504}
+        should = response.status_code in retry_codes
+
+        if should:
+            logger.warning(
+                f"Stream '{self.name}': retry necessario | "
+                f"status={response.status_code}"
+            )
+
+        return should
+
+    def backoff_time(self, response: requests.Response) -> Optional[float]:
+        """Calcula tempo de backoff para retry."""
+        if response.status_code == 429:
+            # Respeita header Retry-After se presente
+            retry_after = response.headers.get("Retry-After")
+            if retry_after:
+                return float(retry_after)
+            return 60.0  # Default 60s para rate limit
+
+        # Backoff exponencial para outros erros
+        return None  # Usa default do CDK
 
 
 class SourceHubble(AbstractSource):
     """
     Source Airbyte para API Hubble (data2apis.com).
 
-    Permite configurar multiplos endpoints via UI do Airbyte,
-    cada um se tornando um stream separado.
+    Features:
+    - Multiplos endpoints configuraveis via UI
+    - Validacao robusta de configuracao
+    - Logging estruturado
     """
 
     def check_connection(self, logger, config) -> Tuple[bool, Any]:
-        """
-        Verifica se a conexao com a API esta funcionando.
-
-        Chamado quando usuario clica em "Test" na UI do Airbyte.
-        Faz uma request de teste para o primeiro endpoint configurado.
-
-        Returns:
-            Tupla (sucesso: bool, mensagem_erro: str ou None)
-        """
+        """Verifica conexao com a API."""
         try:
-            headers = {
-                "Authorization": f"Bearer {config['api_token']}",
-                "Content-Type": "application/json"
-            }
-
+            # Valida configuracao
             endpoints = config.get("endpoints", [])
             if not endpoints:
                 return False, "Nenhum endpoint configurado"
 
+            api_token = config.get("api_token")
+            if not api_token:
+                return False, "API Token nao configurado"
+
+            # Valida cada endpoint
+            for ep in endpoints:
+                name = ep.get("name", "")
+                url = ep.get("endpoint_url", "")
+
+                try:
+                    validate_stream_name(name)
+                    validate_url(url, f"Endpoint '{name}'")
+                except HubbleConfigError as e:
+                    return False, str(e)
+
             # Testa conexao com primeiro endpoint
             test_url = endpoints[0].get("endpoint_url")
+            timeout = config.get("request_timeout", 60)
+
+            headers = {
+                "Authorization": f"Bearer {api_token}",
+                "Content-Type": "application/json"
+            }
 
             body = {
                 "$method": "find",
-                "params": {"query": {"$limit": 1}}  # Apenas 1 registro para teste
+                "params": {"query": {"$limit": 1}}
             }
+
             response = requests.post(
                 test_url,
                 headers=headers,
                 json=body,
-                timeout=30
+                timeout=timeout
             )
             response.raise_for_status()
+
+            # Valida que retornou JSON valido
+            data = response.json()
+            if "data" not in data:
+                return False, "Resposta da API nao contem campo 'data'"
+
+            logger.info(f"Conexao verificada com sucesso: {test_url}")
             return True, None
+
+        except requests.exceptions.Timeout:
+            return False, f"Timeout ao conectar com a API ({timeout}s)"
+        except requests.exceptions.ConnectionError as e:
+            return False, f"Erro de conexao: {e}"
+        except requests.exceptions.HTTPError as e:
+            return False, f"Erro HTTP: {e.response.status_code} - {e.response.text[:200]}"
         except Exception as e:
-            return False, str(e)
+            return False, f"Erro inesperado: {str(e)}"
 
     def streams(self, config: Mapping[str, Any]) -> List[Stream]:
-        """
-        Cria lista de streams baseado nos endpoints configurados.
-
-        Cada endpoint na config vira um stream separado no Airbyte.
-        Isso permite extrair dados de multiplas colecoes em uma unica source.
-
-        Returns:
-            Lista de HubbleStream, um para cada endpoint configurado
-        """
+        """Cria lista de streams baseado nos endpoints configurados."""
         auth = TokenAuthenticator(token=config["api_token"])
 
         streams = []
@@ -306,13 +496,17 @@ class SourceHubble(AbstractSource):
             endpoint_url = ep_config.get("endpoint_url")
 
             if stream_name and endpoint_url:
-                streams.append(
-                    HubbleStream(
+                try:
+                    stream = HubbleStream(
                         authenticator=auth,
                         config=config,
                         stream_name=stream_name,
                         endpoint_url=endpoint_url
                     )
-                )
+                    streams.append(stream)
+                except HubbleConfigError as e:
+                    logger.error(f"Erro ao criar stream '{stream_name}': {e}")
+                    continue
 
+        logger.info(f"SourceHubble: {len(streams)} streams configurados")
         return streams

@@ -20,12 +20,37 @@ connectionSpecification:
       description: Data inicial para sync incremental (ISO format)
       examples:
         - "2024-01-01T00:00:00.000Z"
+      pattern: "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$"
       order: 1
+    page_size:
+      type: integer
+      title: Tamanho da Pagina
+      description: Numero de registros por pagina (padrao 500, max 1000)
+      default: 500
+      minimum: 1
+      maximum: 1000
+      order: 2
+    request_timeout:
+      type: integer
+      title: Timeout (segundos)
+      description: Timeout para requisicoes HTTP (padrao 60)
+      default: 60
+      minimum: 10
+      maximum: 300
+      order: 3
+    max_retries:
+      type: integer
+      title: Max Retries
+      description: Numero maximo de tentativas em caso de erro (padrao 5)
+      default: 5
+      minimum: 1
+      maximum: 10
+      order: 4
     endpoints:
       type: array
       title: Endpoints (Streams)
       description: Lista de endpoints para extrair dados
-      order: 2
+      order: 5
       items:
         type: object
         required:
@@ -36,11 +61,13 @@ connectionSpecification:
             type: string
             title: Nome do Stream
             description: Nome que aparecera no Airbyte (ex. vacancies, candidates)
+            pattern: "^[a-z][a-z0-9_]*$"
             order: 0
           endpoint_url:
             type: string
             title: URL Completa do Endpoint
-            description: URL completa do endpoint da API
+            description: URL completa do endpoint da API (deve comecar com https://)
+            pattern: "^https://[a-zA-Z0-9][a-zA-Z0-9-]*(\\.[a-zA-Z0-9][a-zA-Z0-9-]*)+(/[a-zA-Z0-9_.~-]*)*$"
             examples:
               - "https://hub.data2apis.com/dataset/all-hub-vacancies"
             order: 1
